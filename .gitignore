@@ -1,0 +1,23 @@
+.env
+OLD/
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+# Main binary (replace 'app' with your project name if specific)
+app
+
+*.test
+*.out
+
+vendor/
+
+
+.idea/
+.vscode/
+
+.DS_Store
+Thumbs.db

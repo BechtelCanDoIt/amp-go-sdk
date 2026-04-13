@@ -1,0 +1,115 @@
+# amp-cli Kubernetes Job
+#
+# Runs amp-cli inside the cluster where obs-gateway and AMP API are reachable
+# via in-cluster DNS. No port-forwarding or Ingress required.
+#
+# Usage:
+#   kubectl apply -f deploy/amp-cli-job.yaml
+#   kubectl logs job/amp-cli-health -f
+#
+# Customize the command by changing spec.containers[0].args:
+#   - ["health"]           → connectivity check
+#   - ["token"]            → fetch and print JWT
+#   - ["trace", "-n", "5"] → show last 5 traces
+#   - ["send", "-m", "Hello", "--agent-url", "http://chatbot:8080"]
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: amp-cli-health
+  labels:
+    app: amp-cli
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app: amp-cli
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: amp-cli
+          image: ghcr.io/wso2/amp-cli:latest
+          args: ["health"]
+          env:
+            - name: AMP_OTEL_ENDPOINT
+              value: "http://obs-gateway:22893"
+            - name: AMP_AGENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: amp-agent-secret
+                  key: api-key
+            - name: AMP_BASE_URL
+              value: "http://amp-api:9095"
+            - name: AMP_ORG_NAME
+              value: "myorg"
+            - name: AMP_PROJECT_NAME
+              value: "myproject"
+            - name: AMP_AGENT_NAME
+              value: "chatbot"
+            - name: AMP_ENVIRONMENT
+              value: "development"
+            - name: AGENT_URL
+              value: "http://chatbot:8080"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+---
+# amp-cli interactive Job (for kubectl exec / chat sessions)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: amp-cli-interactive
+  labels:
+    app: amp-cli
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: amp-cli
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: amp-cli
+          image: ghcr.io/wso2/amp-cli:latest
+          # Sleep so we can kubectl exec into it for interactive chat.
+          command: ["sleep", "3600"]
+          env:
+            - name: AMP_OTEL_ENDPOINT
+              value: "http://obs-gateway:22893"
+            - name: AMP_AGENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: amp-agent-secret
+                  key: api-key
+            - name: AMP_BASE_URL
+              value: "http://amp-api:9095"
+            - name: AMP_ORG_NAME
+              value: "myorg"
+            - name: AMP_PROJECT_NAME
+              value: "myproject"
+            - name: AMP_AGENT_NAME
+              value: "chatbot"
+            - name: AMP_ENVIRONMENT
+              value: "development"
+            - name: AGENT_URL
+              value: "http://chatbot:8080"
+            - name: LLM_API_URL
+              value: "http://ollama:11434/v1"
+            - name: LLM_MODEL
+              value: "llama3.2"
+          stdin: true
+          tty: true
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"

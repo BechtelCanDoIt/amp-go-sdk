@@ -1,0 +1,94 @@
+# Reference chatbot Kubernetes Deployment
+#
+# Deploys the amp-go reference chatbot with the full middleware chain
+# and OTLP tracing to obs-gateway.
+#
+# Usage:
+#   kubectl apply -f deploy/chatbot-deployment.yaml
+#   kubectl port-forward svc/chatbot 8080:8080
+#   curl -X POST http://localhost:8080/chat -H "Content-Type: application/json" \
+#     -d '{"message": "Hello!"}'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chatbot
+  labels:
+    app: chatbot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chatbot
+  template:
+    metadata:
+      labels:
+        app: chatbot
+    spec:
+      containers:
+        - name: chatbot
+          image: ghcr.io/wso2/amp-chatbot:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: AMP_OTEL_ENDPOINT
+              value: "http://obs-gateway:22893"
+            - name: AMP_AGENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: amp-agent-secret
+                  key: api-key
+            - name: AMP_BASE_URL
+              value: "http://amp-api:9095"
+            - name: AMP_ORG_NAME
+              value: "myorg"
+            - name: AMP_PROJECT_NAME
+              value: "myproject"
+            - name: AMP_AGENT_NAME
+              value: "chatbot"
+            - name: AMP_ENVIRONMENT
+              value: "development"
+            - name: AMP_TRACE_CONTENT
+              value: "true"
+            - name: LLM_API_URL
+              value: "http://ollama:11434/v1"
+            - name: LLM_MODEL
+              value: "llama3.2"
+            - name: LLM_API_KEY
+              value: ""
+            - name: AGENT_SCOPES
+              value: "read:docs read:orders"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "200m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chatbot
+  labels:
+    app: chatbot
+spec:
+  selector:
+    app: chatbot
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+  type: ClusterIP
