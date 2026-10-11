@@ -35,7 +35,8 @@ Subcommands:
   send    Single-shot message (CI-friendly)
   trace   Print recent traces from agent-manager-observer
   token   Fetch and print a fresh agent JWT
-  health  Verify connectivity to the AMP OTLP endpoint and AMP API`,
+  health  Verify connectivity to the AMP OTLP endpoint and AMP API
+  sleep   Idle for a duration (keeps a pod alive for kubectl exec)`,
 }
 
 func Execute() error {
@@ -52,6 +53,7 @@ func init() {
 	rootCmd.AddCommand(traceCmd)
 	rootCmd.AddCommand(tokenCmd)
 	rootCmd.AddCommand(healthCmd)
+	rootCmd.AddCommand(sleepCmd)
 }
 
 // initSDKClient initializes the shared AMP SDK client. Called by subcommands

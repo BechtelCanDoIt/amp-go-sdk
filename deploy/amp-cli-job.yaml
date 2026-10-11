@@ -84,8 +84,9 @@ spec:
       containers:
         - name: amp-cli
           image: ghcr.io/wso2/amp-cli:latest
-          # Sleep so we can kubectl exec into it for interactive chat.
-          command: ["sleep", "3600"]
+          # Idle so we can kubectl exec into it for interactive chat. The image
+          # is distroless (no shell or sleep binary), so amp-cli does the waiting.
+          args: ["sleep", "1h"]
           env:
             # AMP OTLP endpoint and agent API key, from the AMP Console (register
             # the agent → Generate API Key). Spans go to <endpoint>/v1/traces.
