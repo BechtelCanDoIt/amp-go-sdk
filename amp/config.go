@@ -1,18 +1,31 @@
 // Package amp provides the core Go SDK for the WSO2 Agent Manager platform.
 //
-// amp-go is functionally equivalent to the Python amp-instrumentation SDK,
-// providing agent JWT lifecycle management, OpenTelemetry span instrumentation
-// (agent/llm/tool), least-privilege scope enforcement, and multi-turn
-// conversation identity — all via environment-variable-driven configuration.
+// amp-go tracks WSO2 Agent Manager v1.0.0 and is the Go counterpart of the
+// Python amp-instrumentation package's manual path: InitOTel() wires the
+// OTLP/HTTP exporter to AMP (the analog of init_otel()), and the span helpers
+// emit spans that follow AMP's manual instrumentation contract (OpenTelemetry
+// GenAI semantic conventions plus the OpenLLMetry traceloop.* extension keys).
+// On top of that it offers optional agent JWT lifecycle management,
+// least-privilege scope enforcement, and multi-turn conversation identity —
+// all via environment-variable-driven configuration.
 package amp
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// Version is the WSO2 Agent Manager release this SDK tracks. It is reported
+// as the instrumentation version on every span the SDK emits.
+const Version = "1.0.0"
+
+// otlpTracesPath is the OTLP/HTTP traces signal path appended to
+// AMP_OTEL_ENDPOINT.
+const otlpTracesPath = "/v1/traces"
 
 // Config holds all AMP SDK configuration, populated from AMP_* environment
 // variables. Required fields are validated at Init() time; missing required
@@ -20,13 +33,20 @@ import (
 type Config struct {
 	// --- Required ---
 
-	// OTELEndpoint is the OTLP HTTP endpoint (obs-gateway).
+	// OTELEndpoint is the AMP OTLP/HTTP base endpoint. Spans are POSTed to
+	// <OTELEndpoint>/v1/traces.
 	// Env: AMP_OTEL_ENDPOINT
 	OTELEndpoint string
 
-	// AgentAPIKey is the agent API key from AMP Console.
+	// AgentAPIKey is the agent API key from AMP Console, sent as the
+	// x-amp-api-key header.
 	// Env: AMP_AGENT_API_KEY
 	AgentAPIKey string
+
+	// --- Optional: control plane ---
+	//
+	// Tracing needs none of these. When BaseURL, OrgName, ProjectName and
+	// AgentName are all set, Init() also acquires and refreshes an agent JWT.
 
 	// BaseURL is the AMP API base URL (agent-manager-service).
 	// Env: AMP_BASE_URL
@@ -40,7 +60,8 @@ type Config struct {
 	// Env: AMP_PROJECT_NAME
 	ProjectName string
 
-	// AgentName is the agent name in AMP.
+	// AgentName is the agent name in AMP. Also used as the default
+	// gen_ai.agent.name and as the service.name resource attribute.
 	// Env: AMP_AGENT_NAME
 	AgentName string
 
@@ -63,8 +84,9 @@ type Config struct {
 	// Env: AMP_DEBUG  Default: false
 	Debug bool
 
-	// Environment is the target environment name for trace enrichment.
-	// Env: AMP_ENVIRONMENT  Default: "development"
+	// Environment is the AMP environment name. It scopes agent JWT requests
+	// and trace queries; when empty the AMP API uses its own default.
+	// Env: AMP_ENVIRONMENT  Default: ""
 	Environment string
 
 	// LLMBaseURL is the LLM backend base URL (OpenAI-compatible).
@@ -79,8 +101,8 @@ type Config struct {
 	// Env: LLM_MODEL  Default: "llama3.2"
 	LLMModel string
 
-	// TraceObserverURL is the amp-trace-observer endpoint (used by CLI trace cmd).
-	// If empty, defaults to BaseURL proxy path.
+	// TraceObserverURL is the agent-manager-observer base URL (used by the CLI
+	// trace cmd).
 	// Env: AMP_TRACE_OBSERVER_URL
 	TraceObserverURL string
 
@@ -93,8 +115,8 @@ type Config struct {
 // required fields — call Validate() or let Init() do it.
 func FromEnv() Config {
 	return Config{
-		OTELEndpoint:       os.Getenv("AMP_OTEL_ENDPOINT"),
-		AgentAPIKey:        os.Getenv("AMP_AGENT_API_KEY"),
+		OTELEndpoint:       strings.TrimSpace(os.Getenv("AMP_OTEL_ENDPOINT")),
+		AgentAPIKey:        strings.TrimSpace(os.Getenv("AMP_AGENT_API_KEY")),
 		BaseURL:            os.Getenv("AMP_BASE_URL"),
 		OrgName:            os.Getenv("AMP_ORG_NAME"),
 		ProjectName:        os.Getenv("AMP_PROJECT_NAME"),
@@ -103,7 +125,7 @@ func FromEnv() Config {
 		AgentVersion:       os.Getenv("AMP_AGENT_VERSION"),
 		TokenRefreshBuffer: envDuration("AMP_TOKEN_REFRESH_BUFFER", 5*time.Minute),
 		Debug:              envBool("AMP_DEBUG", false),
-		Environment:        envString("AMP_ENVIRONMENT", "development"),
+		Environment:        os.Getenv("AMP_ENVIRONMENT"),
 		LLMBaseURL:         envString("LLM_API_URL", "http://localhost:11434/v1"),
 		LLMAPIKey:          os.Getenv("LLM_API_KEY"),
 		LLMModel:           envString("LLM_MODEL", "llama3.2"),
@@ -116,23 +138,11 @@ func FromEnv() Config {
 // descriptive error listing every missing field.
 func (c Config) Validate() error {
 	var missing []string
-	if c.OTELEndpoint == "" {
+	if strings.TrimSpace(c.OTELEndpoint) == "" {
 		missing = append(missing, "AMP_OTEL_ENDPOINT")
 	}
-	if c.AgentAPIKey == "" {
+	if strings.TrimSpace(c.AgentAPIKey) == "" {
 		missing = append(missing, "AMP_AGENT_API_KEY")
-	}
-	if c.BaseURL == "" {
-		missing = append(missing, "AMP_BASE_URL")
-	}
-	if c.OrgName == "" {
-		missing = append(missing, "AMP_ORG_NAME")
-	}
-	if c.ProjectName == "" {
-		missing = append(missing, "AMP_PROJECT_NAME")
-	}
-	if c.AgentName == "" {
-		missing = append(missing, "AMP_AGENT_NAME")
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("amp: missing required environment variables: %s", strings.Join(missing, ", "))
@@ -140,27 +150,47 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// TokenEndpoint returns the full URL for the agent token acquisition endpoint.
-func (c Config) TokenEndpoint() string {
-	return fmt.Sprintf("%s/api/v1/orgs/%s/projects/%s/agents/%s/token",
-		strings.TrimRight(c.BaseURL, "/"),
-		c.OrgName,
-		c.ProjectName,
-		c.AgentName,
-	)
+// ControlPlaneConfigured reports whether everything needed to call the AMP API
+// on behalf of this agent (BaseURL, OrgName, ProjectName, AgentName) is set.
+func (c Config) ControlPlaneConfigured() bool {
+	return c.BaseURL != "" && c.OrgName != "" && c.ProjectName != "" && c.AgentName != ""
 }
 
-// TracesEndpoint returns the AMP API proxy URL for querying traces.
-func (c Config) TracesEndpoint() string {
-	if c.TraceObserverURL != "" {
-		return strings.TrimRight(c.TraceObserverURL, "/") + "/api/v1/traces"
+// OTLPTracesEndpoint returns the full OTLP/HTTP traces URL:
+// <AMP_OTEL_ENDPOINT>/v1/traces. An endpoint that already ends in /v1/traces
+// is returned as-is, and a scheme-less endpoint is treated as plain HTTP.
+func (c Config) OTLPTracesEndpoint() string {
+	base := strings.TrimRight(strings.TrimSpace(c.OTELEndpoint), "/")
+	if !strings.Contains(base, "://") {
+		base = "http://" + base
 	}
-	return fmt.Sprintf("%s/api/v1/orgs/%s/projects/%s/agents/%s/traces",
+	if strings.HasSuffix(base, otlpTracesPath) {
+		return base
+	}
+	return base + otlpTracesPath
+}
+
+// TokenEndpoint returns the full URL for the agent token acquisition endpoint.
+func (c Config) TokenEndpoint() string {
+	endpoint := fmt.Sprintf("%s/api/v1/orgs/%s/projects/%s/agents/%s/token",
 		strings.TrimRight(c.BaseURL, "/"),
-		c.OrgName,
-		c.ProjectName,
-		c.AgentName,
+		url.PathEscape(c.OrgName),
+		url.PathEscape(c.ProjectName),
+		url.PathEscape(c.AgentName),
 	)
+	if c.Environment != "" {
+		endpoint += "?environment=" + url.QueryEscape(c.Environment)
+	}
+	return endpoint
+}
+
+// TracesEndpoint returns the agent-manager-observer URL for querying traces,
+// or "" when AMP_TRACE_OBSERVER_URL is not set.
+func (c Config) TracesEndpoint() string {
+	if c.TraceObserverURL == "" {
+		return ""
+	}
+	return strings.TrimRight(c.TraceObserverURL, "/") + "/api/v1/traces"
 }
 
 // --- helpers ---

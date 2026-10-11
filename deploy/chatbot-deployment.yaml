@@ -1,13 +1,13 @@
 # Reference chatbot Kubernetes Deployment
 #
 # Deploys the amp-go reference chatbot with the full middleware chain
-# and OTLP tracing to obs-gateway.
+# and OTLP tracing to AMP.
 #
 # Usage:
 #   kubectl apply -f deploy/chatbot-deployment.yaml
 #   kubectl port-forward svc/chatbot 8080:8080
 #   curl -X POST http://localhost:8080/chat -H "Content-Type: application/json" \
-#     -d '{"message": "Hello!"}'
+#     -d '{"session_id": "demo-1", "message": "Hello!"}'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -31,6 +31,8 @@ spec:
             - containerPort: 8080
               name: http
           env:
+            # AMP OTLP endpoint and agent API key, from the AMP Console (register
+            # the agent → Generate API Key). Spans go to <endpoint>/v1/traces.
             - name: AMP_OTEL_ENDPOINT
               value: "http://obs-gateway:22893"
             - name: AMP_AGENT_API_KEY
@@ -38,16 +40,20 @@ spec:
                 secretKeyRef:
                   name: amp-agent-secret
                   key: api-key
-            - name: AMP_BASE_URL
-              value: "http://amp-api:9095"
-            - name: AMP_ORG_NAME
-              value: "myorg"
-            - name: AMP_PROJECT_NAME
-              value: "myproject"
             - name: AMP_AGENT_NAME
               value: "chatbot"
-            - name: AMP_ENVIRONMENT
-              value: "development"
+            # Optional control plane — only for the agent JWT (`amp-cli token`)
+            # and `amp-cli trace`. Tracing needs none of these.
+            # - name: AMP_BASE_URL
+            #   value: "http://amp-api:9095"
+            # - name: AMP_ORG_NAME
+            #   value: "myorg"
+            # - name: AMP_PROJECT_NAME
+            #   value: "myproject"
+            # - name: AMP_ENVIRONMENT
+            #   value: "default"
+            # - name: AMP_TRACE_OBSERVER_URL
+            #   value: "http://amp-observer:9098"
             - name: AMP_TRACE_CONTENT
               value: "true"
             - name: LLM_API_URL

@@ -17,7 +17,7 @@ import (
 )
 
 // tokenResponse matches the agent-manager-service TokenResponse struct.
-// See: agent-manager-service/spec/token.go
+// See: agent-manager-service/spec/model_token_response.go
 type tokenResponse struct {
 	Token     string `json:"token"`
 	ExpiresAt int64  `json:"expires_at"`
@@ -32,19 +32,47 @@ type tokenRequest struct {
 
 // agentTokenClaims mirrors the agent-manager AgentTokenClaims struct.
 // The agent JWT carries platform identifiers, not scopes.
+// See: agent-manager-service/services/agent_token_manager.go
 type agentTokenClaims struct {
 	jwt.RegisteredClaims
 	ComponentUID   string `json:"component_uid"`
 	EnvironmentUID string `json:"environment_uid"`
 	ProjectUID     string `json:"project_uid,omitempty"`
+	OrgID          string `json:"org_id"`
+	Namespace      string `json:"namespace"`
 }
 
 // tokenState is stored in an atomic.Value for lock-free concurrent access.
 type tokenState struct {
-	Raw       string
-	ExpiresAt time.Time
-	IssuedAt  time.Time
-	Claims    *agentTokenClaims
+	Raw        string
+	ExpiresAt  time.Time
+	IssuedAt   time.Time
+	AcquiredAt time.Time // local clock, when this token was fetched
+	Claims     *agentTokenClaims
+}
+
+// minRefreshInterval is the least time between two successful token
+// acquisitions, whatever the token's lifetime or the refresh buffer say.
+const minRefreshInterval = time.Second
+
+// refreshAt returns when the token should be refreshed: buffer before expiry,
+// but never earlier than half the token's lifetime (a buffer longer than the
+// lifetime would otherwise make every new token due at once), and never
+// sooner than minRefreshInterval after it was acquired.
+func (st *tokenState) refreshAt(buffer time.Duration) time.Time {
+	lead := buffer
+	if half := st.ExpiresAt.Sub(st.AcquiredAt) / 2; lead > half {
+		lead = half
+	}
+	if lead < 0 {
+		lead = 0
+	}
+
+	wakeAt := st.ExpiresAt.Add(-lead)
+	if earliest := st.AcquiredAt.Add(minRefreshInterval); wakeAt.Before(earliest) {
+		wakeAt = earliest
+	}
+	return wakeAt
 }
 
 // TokenManager handles JWT acquisition, atomic storage, and background refresh.
@@ -184,10 +212,11 @@ func (tm *TokenManager) acquire() error {
 	}
 
 	st := &tokenState{
-		Raw:       tr.Token,
-		ExpiresAt: time.Unix(tr.ExpiresAt, 0),
-		IssuedAt:  time.Unix(tr.IssuedAt, 0),
-		Claims:    claims,
+		Raw:        tr.Token,
+		ExpiresAt:  time.Unix(tr.ExpiresAt, 0),
+		IssuedAt:   time.Unix(tr.IssuedAt, 0),
+		AcquiredAt: time.Now(),
+		Claims:     claims,
 	}
 	tm.current.Store(st)
 
@@ -201,7 +230,8 @@ func (tm *TokenManager) acquire() error {
 	return nil
 }
 
-// refreshLoop sleeps until the token nears expiry, then acquires a new one.
+// refreshLoop sleeps until the token nears expiry (see tokenState.refreshAt),
+// then acquires a new one.
 // On failure, retries with exponential backoff (1s, 2s, 4s... up to 60s).
 func (tm *TokenManager) refreshLoop(ctx context.Context) {
 	for {
@@ -211,12 +241,18 @@ func (tm *TokenManager) refreshLoop(ctx context.Context) {
 			return
 		}
 
-		// Wake up at (expires_at - buffer).
-		wakeAt := st.ExpiresAt.Add(-tm.cfg.TokenRefreshBuffer)
+		// Wake up at (expires_at - buffer), bounded so a short-lived token or
+		// an oversized buffer cannot turn this into a tight loop.
+		wakeAt := st.refreshAt(tm.cfg.TokenRefreshBuffer)
 		sleepDur := time.Until(wakeAt)
 		if sleepDur < 0 {
-			// Already past the refresh window — refresh immediately.
 			sleepDur = 0
+		}
+		if lifetime := st.ExpiresAt.Sub(st.AcquiredAt); tm.cfg.TokenRefreshBuffer > lifetime/2 {
+			tm.logger.Warn("token refresh buffer exceeds half the token lifetime — refreshing at half-life instead",
+				zap.Duration("buffer", tm.cfg.TokenRefreshBuffer),
+				zap.Duration("lifetime", lifetime),
+			)
 		}
 
 		tm.logger.Debug("refresh scheduled",

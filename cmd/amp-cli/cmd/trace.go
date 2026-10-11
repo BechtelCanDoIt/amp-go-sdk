@@ -18,26 +18,35 @@ import (
 var (
 	traceLimit  int
 	traceFormat string
+	traceSince  time.Duration
+	traceToken  string
 )
 
 var traceCmd = &cobra.Command{
 	Use:   "trace",
-	Short: "Print recent traces for this agent from amp-trace-observer",
-	Long: `Query amp-trace-observer (or the AMP API proxy) for recent traces
-belonging to this agent. Validates that spans are reaching OpenSearch.
+	Short: "Print recent traces for this agent from agent-manager-observer",
+	Long: `Query agent-manager-observer for recent traces belonging to this agent.
+Validates that spans are reaching OpenSearch.
+
+Requires AMP_TRACE_OBSERVER_URL, AMP_ORG_NAME, AMP_PROJECT_NAME,
+AMP_AGENT_NAME and AMP_ENVIRONMENT. The observer expects a bearer token with
+trace read access: pass one with --token, otherwise the agent JWT is used when
+the control plane is configured.
 
 Example:
   amp-cli trace --n 10 --format table
-  amp-cli trace --format json`,
+  amp-cli trace --since 1h --format json`,
 	RunE: runTrace,
 }
 
 func init() {
 	traceCmd.Flags().IntVarP(&traceLimit, "n", "n", 10, "Number of traces to retrieve")
 	traceCmd.Flags().StringVar(&traceFormat, "format", "table", "Output format: table or json")
+	traceCmd.Flags().DurationVar(&traceSince, "since", 24*time.Hour, "How far back to look for traces")
+	traceCmd.Flags().StringVar(&traceToken, "token", os.Getenv("AMP_TRACE_OBSERVER_TOKEN"), "Bearer token for agent-manager-observer")
 }
 
-// traceOverview matches the trace-observer TraceOverviewResponse.traces[].
+// traceOverview matches the agent-manager-observer TraceOverviewResponse.traces[].
 type traceOverview struct {
 	TraceID      string `json:"traceId"`
 	RootSpanName string `json:"rootSpanName"`
@@ -76,8 +85,28 @@ func showRemoteTraces(c *amp.AMPClient, limit int) error {
 	cfg := c.Config()
 
 	endpoint := cfg.TracesEndpoint()
+	if endpoint == "" {
+		return fmt.Errorf("AMP_TRACE_OBSERVER_URL is not set")
+	}
+
+	// The observer scopes every trace query by org, project, agent and
+	// environment over a time window.
+	scope := []struct{ param, value, env string }{
+		{"organization", cfg.OrgName, "AMP_ORG_NAME"},
+		{"project", cfg.ProjectName, "AMP_PROJECT_NAME"},
+		{"agent", cfg.AgentName, "AMP_AGENT_NAME"},
+		{"environment", cfg.Environment, "AMP_ENVIRONMENT"},
+	}
 	params := url.Values{}
-	params.Set("serviceName", cfg.AgentName)
+	for _, sc := range scope {
+		if sc.value == "" {
+			return fmt.Errorf("%s is required to query traces", sc.env)
+		}
+		params.Set(sc.param, sc.value)
+	}
+	now := time.Now().UTC()
+	params.Set("startTime", now.Add(-traceSince).Format(time.RFC3339))
+	params.Set("endTime", now.Format(time.RFC3339))
 	params.Set("limit", strconv.Itoa(limit))
 	params.Set("sortOrder", "desc")
 
@@ -88,7 +117,13 @@ func showRemoteTraces(c *amp.AMPClient, limit int) error {
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.Token.Token())
+	token := traceToken
+	if token == "" && c.Token != nil {
+		token = c.Token.Token()
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {

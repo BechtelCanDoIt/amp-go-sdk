@@ -64,6 +64,35 @@ func TestFromEnv(t *testing.T) {
 	}
 }
 
+func TestFromEnvTrimsRequired(t *testing.T) {
+	t.Setenv("AMP_OTEL_ENDPOINT", "  http://obs-gateway:22893\n")
+	t.Setenv("AMP_AGENT_API_KEY", " key ")
+
+	cfg := FromEnv()
+	if cfg.OTELEndpoint != "http://obs-gateway:22893" {
+		t.Errorf("OTELEndpoint = %q, want it trimmed", cfg.OTELEndpoint)
+	}
+	if cfg.AgentAPIKey != "key" {
+		t.Errorf("AgentAPIKey = %q, want it trimmed", cfg.AgentAPIKey)
+	}
+}
+
+func TestTokenEndpointEscapes(t *testing.T) {
+	cfg := Config{
+		BaseURL:     "http://amp-api:9095",
+		OrgName:     "my org",
+		ProjectName: "a/b",
+		AgentName:   "agent",
+		Environment: "dev & test",
+	}
+
+	got := cfg.TokenEndpoint()
+	want := "http://amp-api:9095/api/v1/orgs/my%20org/projects/a%2Fb/agents/agent/token?environment=dev+%26+test"
+	if got != want {
+		t.Errorf("TokenEndpoint() = %q, want %q", got, want)
+	}
+}
+
 func TestFromEnvDefaults(t *testing.T) {
 	// Clear all AMP env vars to test defaults.
 	keys := []string{
@@ -86,8 +115,8 @@ func TestFromEnvDefaults(t *testing.T) {
 	if cfg.Debug != false {
 		t.Errorf("default Debug = %v, want false", cfg.Debug)
 	}
-	if cfg.Environment != "development" {
-		t.Errorf("default Environment = %q, want %q", cfg.Environment, "development")
+	if cfg.Environment != "" {
+		t.Errorf("default Environment = %q, want empty", cfg.Environment)
 	}
 	if cfg.LLMBaseURL != "http://localhost:11434/v1" {
 		t.Errorf("default LLMBaseURL = %q, want %q", cfg.LLMBaseURL, "http://localhost:11434/v1")
@@ -112,10 +141,6 @@ func TestValidate(t *testing.T) {
 			cfg: Config{
 				OTELEndpoint: "http://obs:22893",
 				AgentAPIKey:  "key",
-				BaseURL:      "http://amp:9095",
-				OrgName:      "org",
-				ProjectName:  "proj",
-				AgentName:    "agent",
 			},
 			wantErr: false,
 		},
@@ -123,16 +148,24 @@ func TestValidate(t *testing.T) {
 			name:    "all missing",
 			cfg:     Config{},
 			wantErr: true,
-			errMsg:  "AMP_OTEL_ENDPOINT",
+			errMsg:  "AMP_OTEL_ENDPOINT, AMP_AGENT_API_KEY",
 		},
 		{
-			name: "partial missing",
+			name: "api key missing",
 			cfg: Config{
 				OTELEndpoint: "http://obs:22893",
+			},
+			wantErr: true,
+			errMsg:  "AMP_AGENT_API_KEY",
+		},
+		{
+			name: "whitespace only counts as missing",
+			cfg: Config{
+				OTELEndpoint: "  ",
 				AgentAPIKey:  "key",
 			},
 			wantErr: true,
-			errMsg:  "AMP_BASE_URL",
+			errMsg:  "AMP_OTEL_ENDPOINT",
 		},
 	}
 
@@ -146,6 +179,47 @@ func TestValidate(t *testing.T) {
 				if tt.errMsg != "" && !contains(err.Error(), tt.errMsg) {
 					t.Errorf("Validate() error = %q, should contain %q", err.Error(), tt.errMsg)
 				}
+			}
+		})
+	}
+}
+
+func TestControlPlaneConfigured(t *testing.T) {
+	full := Config{
+		BaseURL:     "http://amp-api:9095",
+		OrgName:     "org",
+		ProjectName: "proj",
+		AgentName:   "agent",
+	}
+	if !full.ControlPlaneConfigured() {
+		t.Error("ControlPlaneConfigured() = false, want true")
+	}
+
+	partial := full
+	partial.BaseURL = ""
+	if partial.ControlPlaneConfigured() {
+		t.Error("ControlPlaneConfigured() = true without BaseURL, want false")
+	}
+}
+
+func TestOTLPTracesEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		want     string
+	}{
+		{"http://obs-gateway:22893", "http://obs-gateway:22893/v1/traces"},
+		{"http://obs-gateway:22893/", "http://obs-gateway:22893/v1/traces"},
+		{"https://amp.example.com/otel", "https://amp.example.com/otel/v1/traces"},
+		{"https://amp.example.com/otel/v1/traces", "https://amp.example.com/otel/v1/traces"},
+		{"https://amp.example.com/otel/v1/traces/", "https://amp.example.com/otel/v1/traces"},
+		{"obs-gateway:22893", "http://obs-gateway:22893/v1/traces"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := Config{OTELEndpoint: tt.endpoint}.OTLPTracesEndpoint()
+			if got != tt.want {
+				t.Errorf("OTLPTracesEndpoint() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -181,7 +255,23 @@ func TestTokenEndpointTrailingSlash(t *testing.T) {
 	}
 }
 
-func TestTracesEndpointProxy(t *testing.T) {
+func TestTokenEndpointEnvironment(t *testing.T) {
+	cfg := Config{
+		BaseURL:     "http://amp-api:9095",
+		OrgName:     "org",
+		ProjectName: "proj",
+		AgentName:   "agent",
+		Environment: "staging",
+	}
+
+	got := cfg.TokenEndpoint()
+	want := "http://amp-api:9095/api/v1/orgs/org/projects/proj/agents/agent/token?environment=staging"
+	if got != want {
+		t.Errorf("TokenEndpoint() = %q, want %q", got, want)
+	}
+}
+
+func TestTracesEndpointUnset(t *testing.T) {
 	cfg := Config{
 		BaseURL:     "http://amp-api:9095",
 		OrgName:     "org",
@@ -189,10 +279,8 @@ func TestTracesEndpointProxy(t *testing.T) {
 		AgentName:   "agent",
 	}
 
-	got := cfg.TracesEndpoint()
-	want := "http://amp-api:9095/api/v1/orgs/org/projects/proj/agents/agent/traces"
-	if got != want {
-		t.Errorf("TracesEndpoint() = %q, want %q", got, want)
+	if got := cfg.TracesEndpoint(); got != "" {
+		t.Errorf("TracesEndpoint() = %q, want empty without AMP_TRACE_OBSERVER_URL", got)
 	}
 }
 
