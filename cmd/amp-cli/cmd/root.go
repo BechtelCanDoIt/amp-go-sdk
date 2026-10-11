@@ -27,15 +27,15 @@ var rootCmd = &cobra.Command{
 	Use:   "amp-cli",
 	Short: "AMP Agent CLI — test harness for WSO2 Agent Manager agents",
 	Long: `amp-cli is an interactive test tool for WSO2 Agent Manager agents.
-It runs inside the Kubernetes cluster to reach obs-gateway and AMP API
-via in-cluster DNS.
+It runs inside the Kubernetes cluster to reach the AMP OTLP endpoint and
+AMP API via in-cluster DNS.
 
 Subcommands:
   chat    Interactive multi-turn REPL
   send    Single-shot message (CI-friendly)
-  trace   Print recent traces from amp-trace-observer
+  trace   Print recent traces from agent-manager-observer
   token   Fetch and print a fresh agent JWT
-  health  Verify connectivity to AMP API, obs-gateway, OTLP collector`,
+  health  Verify connectivity to the AMP OTLP endpoint and AMP API`,
 }
 
 func Execute() error {

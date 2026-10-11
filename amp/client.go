@@ -4,28 +4,31 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
 )
 
-// AMPClient is the top-level SDK entry point. It wires together JWT lifecycle,
-// OTLP tracing, conversation management, and HTTP middleware.
+// AMPClient is the top-level SDK entry point. It wires together OTLP tracing,
+// conversation management, HTTP middleware, and (optionally) JWT lifecycle.
 type AMPClient struct {
 	cfg    Config
 	logger *zap.Logger
 
+	// Token is nil unless the control plane is configured
+	// (see Config.ControlPlaneConfigured).
 	Token        *TokenManager
 	Tracer       *TracerManager
 	Conversation *ConversationManager
 }
 
 // Init creates and fully initializes an AMPClient:
-//  1. Validates configuration.
-//  2. Acquires the initial agent JWT.
-//  3. Configures the OTLP exporter and TracerProvider.
-//  4. Starts the background JWT refresh goroutine.
-//  5. Starts the conversation TTL eviction goroutine.
+//  1. Validates configuration (AMP_OTEL_ENDPOINT and AMP_AGENT_API_KEY).
+//  2. Configures the OTLP exporter and TracerProvider.
+//  3. If the control plane is configured, acquires the initial agent JWT and
+//     starts the background refresh goroutine.
+//  4. Starts the conversation TTL eviction goroutine.
 func Init(cfg Config) (*AMPClient, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -45,27 +48,37 @@ func Init(cfg Config) (*AMPClient, error) {
 	logger = logger.Named("amp")
 
 	logger.Info("initializing amp-go SDK",
+		zap.String("version", Version),
 		zap.String("agent", cfg.AgentName),
 		zap.String("org", cfg.OrgName),
 		zap.String("project", cfg.ProjectName),
 		zap.String("environment", cfg.Environment),
 	)
 
-	// 1. Token manager — acquire initial JWT.
-	tokenMgr, err := NewTokenManager(cfg, logger)
-	if err != nil {
-		return nil, err
+	// 1. Token manager — optional; acquire initial JWT.
+	var tokenMgr *TokenManager
+	if cfg.ControlPlaneConfigured() {
+		tokenMgr, err = NewTokenManager(cfg, logger)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		logger.Debug("control plane not configured — agent JWT management disabled")
 	}
 
 	// 2. Tracer manager — OTLP exporter + TracerProvider.
 	tracerMgr, err := NewTracerManager(cfg, logger)
 	if err != nil {
-		tokenMgr.Shutdown()
-		return nil, err
+		if tokenMgr != nil {
+			tokenMgr.Shutdown()
+		}
+		return nil, fmt.Errorf("amp: %w", err)
 	}
 
 	// 3. Start background refresh.
-	tokenMgr.StartRefresh()
+	if tokenMgr != nil {
+		tokenMgr.StartRefresh()
+	}
 
 	// 4. Conversation manager.
 	convMgr := NewConversationManager(cfg.ConversationTTL, logger)
@@ -87,7 +100,9 @@ func Init(cfg Config) (*AMPClient, error) {
 func (c *AMPClient) Shutdown(ctx context.Context) error {
 	c.logger.Info("shutting down amp-go SDK")
 
-	c.Token.Shutdown()
+	if c.Token != nil {
+		c.Token.Shutdown()
+	}
 	c.Conversation.Shutdown()
 
 	if err := c.Tracer.Shutdown(ctx); err != nil {
@@ -114,12 +129,20 @@ func (c *AMPClient) Logger() *zap.Logger {
 // AgentSpan creates a root agent span. See TracerManager.AgentSpan for details.
 func (c *AMPClient) AgentSpan(
 	ctx context.Context,
+	req AgentRequest,
+	fn func(context.Context) (AgentResult, error),
+) (AgentResult, error) {
+	return c.Tracer.AgentSpan(ctx, req, fn)
+}
+
+// ChainSpan creates a workflow span. See TracerManager.ChainSpan for details.
+func (c *AMPClient) ChainSpan(
+	ctx context.Context,
 	name string,
-	conversationID string,
-	inputMessages []Message,
-	fn func(context.Context) error,
-) error {
-	return c.Tracer.AgentSpan(ctx, name, conversationID, inputMessages, fn)
+	input any,
+	fn func(context.Context) (any, error),
+) (any, error) {
+	return c.Tracer.ChainSpan(ctx, name, input, fn)
 }
 
 // LLMSpan creates an LLM child span. See TracerManager.LLMSpan for details.
@@ -131,14 +154,42 @@ func (c *AMPClient) LLMSpan(
 	return c.Tracer.LLMSpan(ctx, req, fn)
 }
 
+// EmbeddingSpan creates an embedding span. See TracerManager.EmbeddingSpan for
+// details.
+func (c *AMPClient) EmbeddingSpan(
+	ctx context.Context,
+	req EmbeddingRequest,
+	fn func(context.Context) (EmbeddingResult, error),
+) (EmbeddingResult, error) {
+	return c.Tracer.EmbeddingSpan(ctx, req, fn)
+}
+
+// RetrieverSpan creates a retrieval span. See TracerManager.RetrieverSpan for
+// details.
+func (c *AMPClient) RetrieverSpan(
+	ctx context.Context,
+	req RetrieverRequest,
+	fn func(context.Context) error,
+) error {
+	return c.Tracer.RetrieverSpan(ctx, req, fn)
+}
+
+// RerankSpan creates a rerank span. See TracerManager.RerankSpan for details.
+func (c *AMPClient) RerankSpan(
+	ctx context.Context,
+	req RerankRequest,
+	fn func(context.Context) error,
+) error {
+	return c.Tracer.RerankSpan(ctx, req, fn)
+}
+
 // ToolSpan creates a tool child span. See TracerManager.ToolSpan for details.
 func (c *AMPClient) ToolSpan(
 	ctx context.Context,
-	toolName string,
-	toolInput any,
+	req ToolRequest,
 	fn func(context.Context) (any, error),
 ) (any, error) {
-	return c.Tracer.ToolSpan(ctx, toolName, toolInput, fn)
+	return c.Tracer.ToolSpan(ctx, req, fn)
 }
 
 // --- Convenience middleware methods ---
@@ -166,18 +217,22 @@ type HealthStatus struct {
 	Error   string `json:"error,omitempty"`
 }
 
-// Health checks connectivity to AMP API, obs-gateway, and OTLP collector.
+// Health checks connectivity to the AMP OTLP endpoint and, when the control
+// plane is configured, the AMP API and agent JWT freshness.
 func (c *AMPClient) Health(ctx context.Context) []HealthStatus {
 	client := &http.Client{Timeout: 10 * time.Second}
-	checks := []struct {
+	type check struct {
 		name string
 		url  string
-	}{
-		{"AMP API", c.cfg.BaseURL + "/health"},
-		{"obs-gateway", c.cfg.OTELEndpoint},
+	}
+	// The OTLP endpoint only accepts POST; any response below 500 proves the
+	// gateway is reachable.
+	checks := []check{{"AMP OTLP endpoint", c.cfg.OTLPTracesEndpoint()}}
+	if c.cfg.BaseURL != "" {
+		checks = append(checks, check{"AMP API", strings.TrimRight(c.cfg.BaseURL, "/") + "/health"})
 	}
 
-	results := make([]HealthStatus, 0, len(checks))
+	results := make([]HealthStatus, 0, len(checks)+1)
 	for _, check := range checks {
 		hs := HealthStatus{Name: check.name, URL: check.url}
 		start := time.Now()
@@ -201,19 +256,21 @@ func (c *AMPClient) Health(ctx context.Context) []HealthStatus {
 	}
 
 	// Token freshness check.
-	tokenStatus := HealthStatus{
-		Name:    "Agent JWT",
-		Healthy: !c.Token.IsExpired(),
-	}
-	if c.Token.IsExpired() {
-		tokenStatus.Error = "token expired"
-	} else {
-		st := c.Token.state()
-		if st != nil {
-			tokenStatus.Latency = fmt.Sprintf("expires in %s", time.Until(st.ExpiresAt).Round(time.Second))
+	if c.Token != nil {
+		tokenStatus := HealthStatus{
+			Name:    "Agent JWT",
+			Healthy: !c.Token.IsExpired(),
 		}
+		if c.Token.IsExpired() {
+			tokenStatus.Error = "token expired"
+		} else {
+			st := c.Token.state()
+			if st != nil {
+				tokenStatus.Latency = fmt.Sprintf("expires in %s", time.Until(st.ExpiresAt).Round(time.Second))
+			}
+		}
+		results = append(results, tokenStatus)
 	}
-	results = append(results, tokenStatus)
 
 	return results
 }

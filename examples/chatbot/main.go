@@ -1,19 +1,19 @@
 // Package main implements a reference HTTP chatbot server demonstrating
-// the amp-go SDK end-to-end: auto-init via blank import, middleware chain
-// (conversation → least-privilege), agent/LLM span instrumentation, and
-// multi-turn conversation management.
+// the amp-go SDK end-to-end: middleware chain (conversation →
+// least-privilege), agent/LLM span instrumentation against AMP's manual
+// instrumentation contract, and multi-turn conversation management.
 //
 // The chatbot talks to any OpenAI-compatible API endpoint (Ollama, AI Gateway,
 // OpenAI) configured via LLM_API_URL.
 //
+// It implements the AMP chat-agent contract: POST /chat accepting
+// {session_id, message} and returning {response, session_id}, plus GET /health.
+//
 // Usage:
 //
-//	export AMP_OTEL_ENDPOINT=http://obs-gateway:22893
-//	export AMP_AGENT_API_KEY=<key>
-//	export AMP_BASE_URL=http://amp-api:9095
-//	export AMP_ORG_NAME=myorg
-//	export AMP_PROJECT_NAME=myproj
-//	export AMP_AGENT_NAME=chatbot
+//	export AMP_OTEL_ENDPOINT=<your-amp-otel-endpoint>
+//	export AMP_AGENT_API_KEY=<key-from-the-amp-console>
+//	export AMP_AGENT_NAME=chatbot                  # optional
 //	export LLM_API_URL=http://localhost:11434/v1   # Ollama
 //	export LLM_MODEL=llama3.2
 //	go run .
@@ -22,7 +22,7 @@
 //
 //	curl -X POST http://localhost:8080/chat \
 //	  -H "Content-Type: application/json" \
-//	  -d '{"message": "Hello, what can you do?"}'
+//	  -d '{"session_id": "demo-1", "message": "Hello, what can you do?"}'
 package main
 
 import (
@@ -113,17 +113,27 @@ func main() {
 	srv.Shutdown(ctx)
 }
 
-// --- Chat handler (BRD §10.3) ---
+// --- Chat handler ---
 
 type chatRequestBody struct {
 	Message string `json:"message"`
+	// SessionID is the conversation ID in the AMP chat-agent contract. When
+	// absent, the X-Conversation-ID header (or a generated ID) is used.
+	SessionID string `json:"session_id,omitempty"`
+	// Optional W3C-baggage correlation; set only when an evaluation run
+	// drives the agent.
+	TaskID  string `json:"task_id,omitempty"`
+	TrialID string `json:"trial_id,omitempty"`
 }
 
 type chatResponseBody struct {
-	Reply          string       `json:"reply"`
-	ConversationID string       `json:"conversation_id"`
-	Tokens         tokenCounts  `json:"tokens"`
-	LatencyMs      int64        `json:"latency_ms"`
+	Response  string `json:"response"`
+	SessionID string `json:"session_id"`
+	// Reply and ConversationID mirror Response and SessionID for amp-cli.
+	Reply          string      `json:"reply"`
+	ConversationID string      `json:"conversation_id"`
+	Tokens         tokenCounts `json:"tokens"`
+	LatencyMs      int64       `json:"latency_ms"`
 }
 
 type tokenCounts struct {
@@ -150,8 +160,13 @@ func chatHandler(w http.ResponseWriter, r *http.Request, client *amp.AMPClient, 
 		return
 	}
 
-	// Extract middleware-injected values.
+	// Extract middleware-injected values. A session_id in the body takes
+	// precedence over the header-derived conversation ID.
 	convID := amp.ConversationIDFromContext(r.Context())
+	if req.SessionID != "" {
+		convID = req.SessionID
+		w.Header().Set("X-Conversation-ID", convID)
+	}
 	effectiveScope := amp.EffectiveScopeFromContext(r.Context())
 
 	logger.Info("chat request",
@@ -169,23 +184,36 @@ func chatHandler(w http.ResponseWriter, r *http.Request, client *amp.AMPClient, 
 	messages := buildLLMMessages(history, req.Message, effectiveScope)
 
 	var llmResult amp.LLMResult
+	provider := detectProvider(cfg.LLMBaseURL)
 
-	// Wrap in AgentSpan → LLMSpan (BRD §10.3).
-	agentErr := client.AgentSpan(r.Context(), cfg.AgentName, convID,
-		[]amp.Message{{Role: "user", Content: req.Message}},
-		func(ctx context.Context) error {
-			var err error
-			llmResult, err = client.LLMSpan(ctx, amp.LLMRequest{
-				Model:       cfg.LLMModel,
-				Provider:    detectProvider(cfg.LLMBaseURL),
-				Temperature: 0.7,
-				Messages:    messages,
-			}, func(spanCtx context.Context) (amp.LLMResult, error) {
-				return callLLM(spanCtx, client, messages)
-			})
-			return err
-		},
-	)
+	// Wrap in AgentSpan → LLMSpan.
+	ctx := amp.WithEvaluationBaggage(r.Context(), req.TaskID, req.TrialID)
+	_, agentErr := client.AgentSpan(ctx, amp.AgentRequest{
+		Description:        "Reference multi-turn chatbot built on the amp-go SDK.",
+		Framework:          "amp-go",
+		Model:              cfg.LLMModel,
+		SystemInstructions: messages[0].Content,
+		ConversationID:     convID,
+		Messages:           []amp.Message{{Role: "user", Content: req.Message}},
+	}, func(ctx context.Context) (amp.AgentResult, error) {
+		var err error
+		llmResult, err = client.LLMSpan(ctx, amp.LLMRequest{
+			Model:       cfg.LLMModel,
+			Provider:    provider,
+			Temperature: amp.Float64(llmTemperature),
+			Messages:    messages,
+		}, func(spanCtx context.Context) (amp.LLMResult, error) {
+			return callLLM(spanCtx, client, messages)
+		})
+		if err != nil {
+			return amp.AgentResult{}, err
+		}
+		return amp.AgentResult{
+			Messages:     []amp.Message{{Role: "assistant", Content: llmResult.Content}},
+			InputTokens:  llmResult.PromptTokens,
+			OutputTokens: llmResult.CompletionTokens,
+		}, nil
+	})
 
 	if agentErr != nil {
 		logger.Error("agent span error", zap.Error(agentErr))
@@ -201,6 +229,8 @@ func chatHandler(w http.ResponseWriter, r *http.Request, client *amp.AMPClient, 
 	// Send response.
 	latency := time.Since(start)
 	resp := chatResponseBody{
+		Response:       llmResult.Content,
+		SessionID:      convID,
 		Reply:          llmResult.Content,
 		ConversationID: convID,
 		Tokens: tokenCounts{
@@ -215,6 +245,8 @@ func chatHandler(w http.ResponseWriter, r *http.Request, client *amp.AMPClient, 
 }
 
 // --- LLM Backend (OpenAI-compatible) ---
+
+const llmTemperature = 0.7
 
 // openAIChatRequest is the request body for the OpenAI /v1/chat/completions API.
 type openAIChatRequest struct {
@@ -244,7 +276,7 @@ func callLLM(ctx context.Context, client *amp.AMPClient, messages []amp.Message)
 	reqBody := openAIChatRequest{
 		Model:       cfg.LLMModel,
 		Messages:    messages,
-		Temperature: 0.7,
+		Temperature: llmTemperature,
 	}
 
 	bodyBytes, _ := json.Marshal(reqBody)

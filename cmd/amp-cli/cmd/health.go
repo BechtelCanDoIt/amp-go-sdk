@@ -12,7 +12,7 @@ import (
 
 var healthCmd = &cobra.Command{
 	Use:   "health",
-	Short: "Verify connectivity to AMP API, obs-gateway, and OTLP collector",
+	Short: "Verify connectivity to the AMP OTLP endpoint and AMP API",
 	Long: `Check that all upstream services required by the SDK are reachable.
 Useful for validating the K8s deployment and in-cluster DNS resolution.
 

@@ -8,12 +8,13 @@
 // The package-level init() function runs before main() and:
 //  1. Reads all AMP_* environment variables via FromEnv().
 //  2. Validates required variables — panics with a clear message if absent.
-//  3. Calls amp.Init() to acquire the agent JWT, configure OTLP, and start
-//     the background refresh goroutine.
+//  3. Calls amp.Init() to configure the OTLP exporter to AMP (and, when the
+//     control plane is configured, acquire and refresh the agent JWT).
 //  4. Registers a SIGTERM/SIGINT handler that calls Shutdown() before exit.
 //
 // For cases where explicit control is preferred, use amp.Init(cfg) directly
-// instead of this package.
+// instead of this package. To wire only the exporter and emit your own spans,
+// use amp.InitOTel().
 package instrumentation
 
 import (
@@ -38,12 +39,8 @@ func init() {
 	if err := cfg.Validate(); err != nil {
 		panic(fmt.Sprintf("amp-go auto-init failed: %v\n\n"+
 			"The amp-go instrumentation package requires these environment variables:\n"+
-			"  AMP_OTEL_ENDPOINT    — OTLP HTTP endpoint (obs-gateway)\n"+
+			"  AMP_OTEL_ENDPOINT    — AMP OTLP/HTTP endpoint\n"+
 			"  AMP_AGENT_API_KEY    — Agent API key from AMP Console\n"+
-			"  AMP_BASE_URL         — AMP API base URL\n"+
-			"  AMP_ORG_NAME         — Organization name\n"+
-			"  AMP_PROJECT_NAME     — Project name\n"+
-			"  AMP_AGENT_NAME       — Agent name\n"+
 			"\nSet the missing variables and restart.", err))
 	}
 

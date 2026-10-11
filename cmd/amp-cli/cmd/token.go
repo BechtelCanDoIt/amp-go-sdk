@@ -34,6 +34,10 @@ func runToken(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if c.Token == nil {
+		return fmt.Errorf("agent JWT management is disabled: set AMP_BASE_URL, AMP_ORG_NAME, AMP_PROJECT_NAME and AMP_AGENT_NAME")
+	}
+
 	token := c.Token.Token()
 	claims := c.Token.Claims()
 	expiresAt := c.Token.ExpiresAt()
@@ -45,6 +49,8 @@ func runToken(cmd *cobra.Command, args []string) error {
 			"component_uid":   claims.ComponentUID,
 			"environment_uid": claims.EnvironmentUID,
 			"project_uid":     claims.ProjectUID,
+			"org_id":          claims.OrgID,
+			"namespace":       claims.Namespace,
 			"expires_at":      expiresAt.Format(time.RFC3339),
 			"issued_at":       issuedAt.Format(time.RFC3339),
 			"ttl_seconds":     int(time.Until(expiresAt).Seconds()),
@@ -60,6 +66,8 @@ func runToken(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Component UID:   %s\n", claims.ComponentUID)
 	fmt.Printf("Environment UID: %s\n", claims.EnvironmentUID)
 	fmt.Printf("Project UID:     %s\n", claims.ProjectUID)
+	fmt.Printf("Org ID:          %s\n", claims.OrgID)
+	fmt.Printf("Namespace:       %s\n", claims.Namespace)
 	fmt.Printf("Issued At:       %s\n", issuedAt.Format(time.RFC3339))
 	fmt.Printf("Expires At:      %s\n", expiresAt.Format(time.RFC3339))
 	fmt.Printf("TTL:             %s\n", time.Until(expiresAt).Round(time.Second))
