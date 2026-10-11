@@ -8,7 +8,7 @@ A first-class Go SDK for the [WSO2 Agent Manager](https://github.com/wso2/agent-
 |---|---|
 | `amp/` | Core SDK: OTLP exporter setup, contract span helpers, conversation management, HTTP middleware, optional JWT lifecycle |
 | `instrumentation/` | Zero-code auto-init via a blank import: sets up the exporter and client before `main()`. It does not create spans for you |
-| `cmd/amp-cli/` | CLI test harness: `chat`, `send`, `trace`, `token`, `health` subcommands |
+| `cmd/amp-cli/` | CLI test harness: `chat`, `send`, `trace`, `token`, `health`, `sleep` subcommands |
 | `examples/chatbot/` | Reference HTTP chatbot with full middleware chain and LLM integration |
 | `deploy/` | Kubernetes manifests for CLI Job and chatbot Deployment |
 
@@ -104,7 +104,7 @@ kubectl apply -f deploy/chatbot-deployment.yaml
 kubectl apply -f deploy/amp-cli-job.yaml
 kubectl logs job/amp-cli-health -f
 
-# Interactive CLI inside the cluster
+# Interactive CLI inside the cluster (the pod idles for an hour via `amp-cli sleep 1h`)
 kubectl exec -it job/amp-cli-interactive -- amp-cli chat --agent-url http://chatbot:8080
 ```
 
@@ -421,6 +421,7 @@ amp-go/
 │       ├── trace.go            Query agent-manager-observer
 │       ├── token.go            Fetch agent JWT
 │       ├── health.go           Connectivity check
+│       ├── sleep.go            Idle (keeps a pod alive for kubectl exec)
 │       └── cli_test.go         Command tests
 ├── examples/chatbot/
 │   ├── main.go                 Reference HTTP chatbot

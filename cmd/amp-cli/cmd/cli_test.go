@@ -541,3 +541,45 @@ func TestChat_AgentErrorKeepsSessionAlive(t *testing.T) {
 		t.Errorf("expected the error to be shown and the REPL to continue:\n%s", out)
 	}
 }
+
+// --- sleep ---
+
+func TestSleep_WaitsThenExits(t *testing.T) {
+	start := time.Now()
+	if err := sleepCmd.RunE(sleepCmd, []string{"150ms"}); err != nil {
+		t.Fatalf("sleep error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 150*time.Millisecond || elapsed > 2*time.Second {
+		t.Errorf("sleep 150ms returned after %s", elapsed)
+	}
+}
+
+func TestSleep_StopsWhenCancelled(t *testing.T) {
+	// Pod deletion sends SIGTERM, which cancels the context: the process must
+	// exit promptly rather than sit out the remaining hour.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		sleepFor(ctx, time.Hour)
+		close(done)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sleepFor did not return after its context was cancelled")
+	}
+}
+
+func TestSleep_RejectsBadDuration(t *testing.T) {
+	// "3600" is what the manifest used to pass to the missing sleep binary.
+	for _, arg := range []string{"3600", "soon", "-5m"} {
+		if err := sleepCmd.RunE(sleepCmd, []string{arg}); err == nil {
+			t.Errorf("sleep %q should be rejected", arg)
+		}
+	}
+	if err := sleepCmd.Args(sleepCmd, nil); err == nil {
+		t.Error("sleep with no duration should be rejected")
+	}
+}
